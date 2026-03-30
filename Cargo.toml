@@ -1,0 +1,27 @@
+[package]
+name        = "fast_copy"
+version     = "1.0.0"
+edition     = "2021"
+authors     = ["ahsocode"]
+description = "High-speed portable file copier"
+
+[[bin]]
+name = "fast_copy"
+path = "src/main.rs"
+
+[dependencies]
+eframe            = { version = "0.28", features = ["default"] }
+egui              = "0.28"
+rfd               = "0.15"
+rayon             = "1.10"
+walkdir           = "2.5"
+crossbeam-channel = "0.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true
