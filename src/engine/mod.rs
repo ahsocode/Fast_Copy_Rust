@@ -138,11 +138,8 @@ fn run_copy(job: CopyJob, tx: Sender<CopyProgress>, cancel: Arc<AtomicBool>) {
         return;
     }
 
-    // 2. Scan total bytes
-    let bytes_total = scan_total_size(&sources);
-
-    // 3. Count total files
-    let files_total = count_total_files(&sources);
+    // 2. Scan total bytes AND file count in a single pass (Bug 4 fix)
+    let (bytes_total, files_total) = scan_sources(&sources);
 
     // 4. Create destination dir
     if let Err(e) = std::fs::create_dir_all(&job.destination) {
@@ -437,47 +434,52 @@ fn copy_small_files(
     cancel: &Arc<AtomicBool>,
     start_time: Instant,
 ) {
-    let bytes_done = Arc::new(AtomicU64::new(0));
-    let files_done = Arc::new(AtomicU64::new(0));
-    let current_file = Arc::new(Mutex::new(String::new()));
-    let errors = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let bytes_done    = Arc::new(AtomicU64::new(0));
+    let files_done    = Arc::new(AtomicU64::new(0));
+    let current_file  = Arc::new(Mutex::new(String::new()));
+    let errors        = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
 
-    let bytes_done_coord = bytes_done.clone();
-    let files_done_coord = files_done.clone();
-    let current_file_coord = current_file.clone();
-    let errors_coord = errors.clone();
-    let cancel_coord = cancel.clone();
-    let tx_coord = tx.clone();
+    // Bug 1 fix: explicit done flag so coordinator exits even when files_total == 0
+    let rayon_done = Arc::new(AtomicBool::new(false));
 
-    // Coordinator thread: sends progress snapshots at 20 Hz (50ms)
+    let bytes_done_c   = bytes_done.clone();
+    let files_done_c   = files_done.clone();
+    let current_file_c = current_file.clone();
+    let errors_c       = errors.clone();
+    let cancel_c       = cancel.clone();
+    let rayon_done_c   = rayon_done.clone();
+    let tx_c           = tx.clone();
+
+    // Coordinator: emits progress snapshots at 20 Hz until rayon finishes or cancelled
     let coordinator = std::thread::spawn(move || {
         let mut speed_tracker = SpeedTracker::new();
         let mut prev_bytes: u64 = 0;
+
         loop {
             std::thread::sleep(Duration::from_millis(50));
 
-            let bd = bytes_done_coord.load(Ordering::Relaxed);
-            let fd = files_done_coord.load(Ordering::Relaxed);
-            let cf = current_file_coord.lock().unwrap().clone();
-            let errs = errors_coord.lock().unwrap().clone();
+            let bd    = bytes_done_c.load(Ordering::Relaxed);
+            let fd    = files_done_c.load(Ordering::Relaxed);
+            let cf    = current_file_c.lock().unwrap().clone();
+            let errs  = errors_c.lock().unwrap().clone();
+            let done  = rayon_done_c.load(Ordering::SeqCst);   // Bug 1 fix
+            let cancelled = cancel_c.load(Ordering::SeqCst);
 
             let delta = bd.saturating_sub(prev_bytes);
-            speed_tracker.add(delta);
+            // Bug 2 fix: only add sample when bytes actually moved
+            if delta > 0 {
+                speed_tracker.add(delta);
+            }
             prev_bytes = bd;
 
-            let speed = speed_tracker.speed();
+            let speed   = speed_tracker.speed();
             let elapsed = start_time.elapsed().as_secs_f64();
             let remaining = bytes_total.saturating_sub(bd);
-            let eta = if speed > 0.0 {
-                remaining as f64 / speed
-            } else {
-                0.0
-            };
+            let eta = if speed > 0.0 { remaining as f64 / speed } else { 0.0 };
 
-            let finished = fd >= files_total && files_total > 0;
-            let cancelled = cancel_coord.load(Ordering::SeqCst);
+            let finished = done && !cancelled;
 
-            let _ = tx_coord.send(CopyProgress {
+            let _ = tx_c.send(CopyProgress {
                 bytes_done: bd,
                 bytes_total,
                 files_done: fd,
@@ -503,25 +505,25 @@ fn copy_small_files(
             return;
         }
 
-        let src_str = src.to_string_lossy().to_string();
+        let src_str   = src.to_string_lossy().to_string();
+        let file_size = src.metadata().map(|m| m.len()).unwrap_or(0);
 
         if let Ok(mut cf) = current_file.lock() {
             *cf = src_str.clone();
         }
 
-        let file_size = src.metadata().map(|m| m.len()).unwrap_or(0);
-
         let result = if file_size <= 4 * 1024 * 1024 {
-            // Small file: use std::fs::copy (OS-optimised)
-            std::fs::copy(src, dst).map(|_| ())
+            // Small file: std::fs::copy (OS-optimised — CopyFileEx/copy_file_range/clonefile)
+            std::fs::copy(src, dst).map(|n| {
+                bytes_done.fetch_add(n, Ordering::Relaxed);  // use actual bytes copied
+            })
         } else {
-            // Larger file: manual 1 MB buffered copy
-            copy_buffered(src, dst, cancel)
+            // Larger file: 1 MB buffered copy with per-chunk progress (Bug 3 fix)
+            copy_buffered(src, dst, cancel, &bytes_done)
         };
 
         match result {
             Ok(_) => {
-                bytes_done.fetch_add(file_size, Ordering::Relaxed);
                 files_done.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
@@ -533,14 +535,17 @@ fn copy_small_files(
         }
     });
 
-    // Wait for coordinator to finish sending the final progress
+    // Signal coordinator that rayon pool is done (Bug 1 fix)
+    rayon_done.store(true, Ordering::SeqCst);
     let _ = coordinator.join();
 }
 
+/// 1 MB buffered copy with per-chunk progress reporting (Bug 3 fix).
 fn copy_buffered(
     src: &Path,
     dst: &Path,
     cancel: &Arc<AtomicBool>,
+    bytes_done: &Arc<AtomicU64>,    // updated after every chunk
 ) -> std::io::Result<()> {
     const BUF_SIZE: usize = 1024 * 1024; // 1 MB
     let mut src_file = std::fs::File::open(src)?;
@@ -561,61 +566,48 @@ fn copy_buffered(
             break;
         }
         dst_file.write_all(&buf[..n])?;
+        // Report bytes written after each chunk so coordinator can track live progress
+        bytes_done.fetch_add(n as u64, Ordering::Relaxed);
     }
     Ok(())
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-pub fn scan_total_size(sources: &[PathBuf]) -> u64 {
-    let mut total: u64 = 0;
+/// Scan all sources in a single pass and return (total_bytes, total_files).
+/// Bug 4 fix: replaces separate scan_total_size + count_total_files (double I/O).
+pub fn scan_sources(sources: &[PathBuf]) -> (u64, u64) {
+    let mut total_bytes: u64 = 0;
+    let mut total_files: u64 = 0;
     for src in sources {
         if src.is_dir() {
             for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
                 if entry.file_type().is_file() {
-                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    total_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    total_files += 1;
                 }
             }
         } else if src.is_file() {
-            total += src.metadata().map(|m| m.len()).unwrap_or(0);
+            total_bytes += src.metadata().map(|m| m.len()).unwrap_or(0);
+            total_files += 1;
         }
     }
-    total
-}
-
-fn count_total_files(sources: &[PathBuf]) -> u64 {
-    let mut total: u64 = 0;
-    for src in sources {
-        if src.is_dir() {
-            for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().is_file() {
-                    total += 1;
-                }
-            }
-        } else if src.is_file() {
-            total += 1;
-        }
-    }
-    total
+    (total_bytes, total_files)
 }
 
 /// Build (src_file, dst_file) pairs for all files under `src_dir`,
 /// mirroring the directory structure under `dst_base`.
 fn collect_file_pairs(src_dir: &Path, dst_base: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let parent = src_dir.parent().unwrap_or(src_dir);
-    let dir_name = src_dir.file_name().unwrap_or_default();
-    let dst_root = dst_base.join(dir_name);
+    // Bug 5 fix: removed unused `parent` and `_rel` dead code
+    let dst_root = dst_base.join(src_dir.file_name().unwrap_or_default());
 
     WalkDir::new(src_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| {
-            let _rel = e.path().strip_prefix(parent).unwrap_or(e.path());
             let dst = dst_root.join(
-                e.path()
-                    .strip_prefix(src_dir)
-                    .unwrap_or(e.path()),
+                e.path().strip_prefix(src_dir).unwrap_or(e.path()),
             );
             (e.path().to_path_buf(), dst)
         })

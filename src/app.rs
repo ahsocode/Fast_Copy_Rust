@@ -332,7 +332,6 @@ impl eframe::App for FastCopyApp {
                         .id_source("sources_scroll")
                         .max_height(ui.available_height() - 80.0)
                         .show(ui, |ui: &mut egui::Ui| {
-                            let to_remove: Option<usize> = None;
                             for (i, src) in self.sources.iter().enumerate() {
                                 let label = src
                                     .file_name()
@@ -349,14 +348,10 @@ impl eframe::App for FastCopyApp {
                                     .selectable_label(is_selected, rt)
                                     .on_hover_text(&full);
                                 if resp.clicked() {
-                                    self.selected_source = if is_selected {
-                                        None
-                                    } else {
-                                        Some(i)
-                                    };
+                                    self.selected_source =
+                                        if is_selected { None } else { Some(i) };
                                 }
                             }
-                            let _ = to_remove;
                         });
 
                     ui.add_space(6.0);
