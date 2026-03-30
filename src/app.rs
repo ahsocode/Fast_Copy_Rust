@@ -1,12 +1,79 @@
 use egui::{Color32, RichText, Visuals};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::engine::{CopyEngine, CopyJob, CopyMode, CopyProgress};
 
+// ─── Browser types ────────────────────────────────────────────────────────────
+
+struct BrowserEntry {
+    name: String,
+    path: PathBuf,
+    size: u64,
+    is_dir: bool,
+    checked: bool,
+}
+
+struct BrowserState {
+    current_dir: PathBuf,
+    entries: Vec<BrowserEntry>,
+    /// Deferred navigation target — set during iteration, applied after borrow ends.
+    navigate_to: Option<PathBuf>,
+    err: Option<String>,
+}
+
+impl BrowserState {
+    fn new(start: PathBuf) -> Self {
+        let mut s = BrowserState {
+            current_dir: start.clone(),
+            entries: Vec::new(),
+            navigate_to: None,
+            err: None,
+        };
+        s.load_dir(&start.clone());
+        s
+    }
+
+    fn load_dir(&mut self, path: &PathBuf) {
+        self.err = None;
+        self.entries.clear();
+        self.current_dir = path.clone();
+        let rd = match std::fs::read_dir(path) {
+            Ok(rd) => rd,
+            Err(e) => {
+                self.err = Some(e.to_string());
+                return;
+            }
+        };
+
+        let mut entries: Vec<BrowserEntry> = rd
+            .filter_map(|r| r.ok())
+            .map(|de| {
+                let name = de.file_name().to_string_lossy().to_string();
+                let path = de.path();
+                let meta = de.metadata().ok();
+                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let size = if is_dir {
+                    0
+                } else {
+                    meta.map(|m| m.len()).unwrap_or(0)
+                };
+                BrowserEntry { name, path, size, is_dir, checked: false }
+            })
+            .collect();
+
+        // Folders first, then alphabetical
+        entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        self.entries = entries;
+    }
+}
+
 // ─── App struct ───────────────────────────────────────────────────────────────
 
 pub struct FastCopyApp {
-    sources: Vec<std::path::PathBuf>,
+    sources: Vec<PathBuf>,
     destination: String,
     mode: CopyMode,
     engine: Option<Arc<CopyEngine>>,
@@ -17,6 +84,8 @@ pub struct FastCopyApp {
     selected_source: Option<usize>,
     show_error_window: bool,
     status_message: String,
+    browser_open: bool,
+    browser: BrowserState,
 }
 
 // ─── Catppuccin Mocha palette ────────────────────────────────────────────────
@@ -67,6 +136,7 @@ impl FastCopyApp {
         );
         cc.egui_ctx.set_style(style);
 
+        let home = dirs_home();
         FastCopyApp {
             sources: Vec::new(),
             destination: String::new(),
@@ -79,10 +149,12 @@ impl FastCopyApp {
             selected_source: None,
             show_error_window: false,
             status_message: String::new(),
+            browser_open: false,
+            browser: BrowserState::new(home),
         }
     }
 
-    fn add_source(&mut self, path: std::path::PathBuf) {
+    fn add_source(&mut self, path: PathBuf) {
         if !self.sources.contains(&path) {
             self.sources.push(path);
         }
@@ -384,6 +456,19 @@ impl eframe::App for FastCopyApp {
                             }
                         }
 
+                        // Browse & Select
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Browse & Select…").color(MANTLE).strong(),
+                                )
+                                .fill(GREEN),
+                            )
+                            .clicked()
+                        {
+                            self.browser_open = true;
+                        }
+
                         // Remove Selected
                         let can_remove = self.selected_source.is_some();
                         let remove_btn = egui::Button::new(
@@ -434,6 +519,175 @@ impl eframe::App for FastCopyApp {
                     }
                 });
             });
+
+        // ── Browser window ────────────────────────────────────────────────────
+        if self.browser_open {
+            // Apply deferred navigation from previous frame
+            if let Some(nav_path) = self.browser.navigate_to.take() {
+                self.browser.load_dir(&nav_path);
+            }
+
+            let mut open = self.browser_open;
+            let mut paths_to_add: Vec<PathBuf> = Vec::new();
+            let mut do_close = false;
+
+            egui::Window::new("Browse & Select Files / Folders")
+                .open(&mut open)
+                .resizable(true)
+                .default_size([700.0, 480.0])
+                .min_size([500.0, 340.0])
+                .show(ctx, |ui| {
+                    // Path bar
+                    ui.horizontal(|ui| {
+                        let up_btn = egui::Button::new(RichText::new("↑ Up").color(TEXT))
+                            .fill(SURFACE0)
+                            .min_size(egui::vec2(50.0, 24.0));
+                        if ui.add(up_btn).clicked() {
+                            let parent = self.browser.current_dir.parent()
+                                .map(|p| p.to_path_buf());
+                            if let Some(p) = parent {
+                                if p != self.browser.current_dir {
+                                    self.browser.navigate_to = Some(p);
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                truncate_str(&self.browser.current_dir.to_string_lossy(), 60)
+                            )
+                            .color(OVERLAY0)
+                            .size(12.5),
+                        );
+                    });
+
+                    if let Some(ref err) = self.browser.err.clone() {
+                        ui.label(RichText::new(format!("Error: {}", err)).color(RED));
+                    }
+
+                    ui.add_space(4.0);
+
+                    // File listing
+                    let checked_count = self.browser.entries.iter().filter(|e| e.checked).count();
+                    egui::ScrollArea::vertical()
+                        .id_source("browser_scroll")
+                        .max_height(ui.available_height() - 80.0)
+                        .show(ui, |ui| {
+                            let n = self.browser.entries.len();
+                            for i in 0..n {
+                                let entry = &self.browser.entries[i];
+                                let name = entry.name.clone();
+                                let is_dir = entry.is_dir;
+                                let size_str = if is_dir {
+                                    "Folder".to_string()
+                                } else {
+                                    fmt_size(entry.size)
+                                };
+                                let entry_path = entry.path.clone();
+
+                                ui.horizontal(|ui| {
+                                    // Checkbox
+                                    let mut checked = self.browser.entries[i].checked;
+                                    if ui.checkbox(&mut checked, "").changed() {
+                                        self.browser.entries[i].checked = checked;
+                                    }
+
+                                    // Name — click folder to navigate
+                                    let name_color = if is_dir { BLUE } else { TEXT };
+                                    let name_rt = RichText::new(&name)
+                                        .color(name_color)
+                                        .size(13.5);
+                                    let resp = ui.add(
+                                        egui::Label::new(name_rt)
+                                            .sense(egui::Sense::click()),
+                                    );
+                                    if resp.double_clicked() && is_dir {
+                                        self.browser.navigate_to = Some(entry_path.clone());
+                                    }
+                                    resp.on_hover_text(entry_path.to_string_lossy().as_ref());
+
+                                    // Size
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(&size_str)
+                                                    .color(OVERLAY0)
+                                                    .size(12.0),
+                                            );
+                                        },
+                                    );
+                                });
+                                if i + 1 < n {
+                                    ui.add(egui::Separator::default().spacing(1.0));
+                                }
+                            }
+                        });
+
+                    ui.add_space(4.0);
+
+                    // Bulk controls
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(RichText::new("Select All").color(TEXT)).fill(SURFACE0))
+                            .clicked()
+                        {
+                            for e in self.browser.entries.iter_mut() {
+                                e.checked = true;
+                            }
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("Clear All").color(TEXT)).fill(SURFACE0))
+                            .clicked()
+                        {
+                            for e in self.browser.entries.iter_mut() {
+                                e.checked = false;
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Cancel
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Cancel").color(TEXT))
+                                        .fill(SURFACE0),
+                                )
+                                .clicked()
+                            {
+                                do_close = true;
+                            }
+                            ui.add_space(6.0);
+                            // Add Selected
+                            let label = if checked_count > 0 {
+                                format!("Add {} Selected", checked_count)
+                            } else {
+                                "Add Selected".to_string()
+                            };
+                            let add_btn = egui::Button::new(
+                                RichText::new(&label).color(MANTLE).strong(),
+                            )
+                            .fill(BLUE)
+                            .min_size(egui::vec2(130.0, 28.0));
+                            if ui.add_enabled(checked_count > 0, add_btn).clicked() {
+                                for e in self.browser.entries.iter() {
+                                    if e.checked {
+                                        paths_to_add.push(e.path.clone());
+                                    }
+                                }
+                                do_close = true;
+                            }
+                        });
+                    });
+                });
+
+            // Add checked paths to sources
+            for p in paths_to_add {
+                self.add_source(p);
+            }
+            if do_close {
+                open = false;
+            }
+            self.browser_open = open;
+        }
 
         // ── Error window ──────────────────────────────────────────────────────
         if self.show_error_window && !self.progress.errors.is_empty() {
@@ -511,6 +765,13 @@ pub fn fmt_time(secs: f64) -> String {
     } else {
         format!("{:02}:{:02}", m, s)
     }
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
